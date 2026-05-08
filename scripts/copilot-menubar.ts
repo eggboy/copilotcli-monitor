@@ -21,9 +21,16 @@ const PIN_FILE = join(COPILOT_DIR, '.comonitor-primary');
 interface SessionMeta {
   id: string;
   cwd: string;
+  gitRoot: string;
   repository: string;
   branch: string;
   summary: string;
+}
+
+interface InstructionFile {
+  path: string;   // display path (~ for home, relative for repo)
+  label: string;  // short human-readable type label
+  scope: 'repo' | 'global';
 }
 
 interface ToolStat {
@@ -60,6 +67,7 @@ interface SkillInvocation {
 interface SessionStats {
   meta: SessionMeta;
   model: string;
+  reasoningEffort: string;
   startTime: string;
   lastActivity: string;
   isActive: boolean; // has inuse lock
@@ -71,6 +79,7 @@ interface SessionStats {
   activeSubagents: Map<string, SubagentInfo>;
   completedSubagents: SubagentInfo[];
   skills: SkillInvocation[];
+  instructionFiles: InstructionFile[];
 }
 
 // ── Session Discovery ──────────────────────────────────────────────────
@@ -103,11 +112,102 @@ function findAllSessions(): SessionEntry[] {
   return sessions;
 }
 
+// ── Instruction File Discovery ─────────────────────────────────────────
+
+// Known instruction file patterns checked relative to gitRoot (and cwd when different).
+const INSTRUCTION_CANDIDATES: Array<{ rel: string; label: string }> = [
+  { rel: '.github/copilot-instructions.md', label: 'Copilot' },
+  { rel: 'AGENTS.md',                       label: 'Agents'  },
+  { rel: 'CLAUDE.md',                       label: 'Claude'  },
+  { rel: '.cursorrules',                    label: 'Cursor'  },
+  { rel: 'copilot-instructions.md',         label: 'Copilot' },
+];
+
+// Global (user-level) directories to scan for instruction files.
+// Each entry: absolute dir path, label, and file extension filter.
+function globalInstructionDirs(): Array<{ dir: string; label: string; exts: string[] }> {
+  const home = homedir();
+  const vscodeBase = join(home, 'Library', 'Application Support');
+  return [
+    { dir: join(home, '.copilot', 'instructions'),               label: 'Copilot', exts: ['.md'] },
+    { dir: join(home, '.claude', 'rules'),                       label: 'Claude',  exts: ['.md'] },
+    { dir: join(home, '.copilot', 'hooks', '.github', 'instructions'), label: 'Copilot', exts: ['.md'] },
+    { dir: join(home, '.copilot', 'hooks', '.claude', 'rules'),  label: 'Claude',  exts: ['.md'] },
+    { dir: join(vscodeBase, 'Code', 'User', 'prompts'),          label: 'VSCode',  exts: ['.md', '.prompt.md', '.agent.md', '.instructions.md'] },
+    { dir: join(vscodeBase, 'Code - Insiders', 'User', 'prompts'), label: 'VSCode', exts: ['.md', '.prompt.md', '.agent.md', '.instructions.md'] },
+  ];
+}
+
+function scanDir(dir: string, exts: string[], label: string, scope: InstructionFile['scope'], seen: Set<string>, home: string): InstructionFile[] {
+  const found: InstructionFile[] = [];
+  if (!existsSync(dir)) return found;
+  try {
+    for (const f of readdirSync(dir)) {
+      if (f.endsWith('.bak')) continue;
+      if (!exts.some(ext => f.endsWith(ext))) continue;
+      const full = join(dir, f);
+      if (seen.has(full)) continue;
+      seen.add(full);
+      const display = full.startsWith(home) ? '~' + full.slice(home.length) : full;
+      found.push({ path: display, label, scope });
+    }
+  } catch { /* ignore unreadable dirs */ }
+  return found;
+}
+
+function findInstructionFiles(gitRoot: string, cwd: string): InstructionFile[] {
+  const found: InstructionFile[] = [];
+  const seen = new Set<string>();
+  const home = homedir();
+
+  const checkFile = (base: string, rel: string, label: string) => {
+    if (!base || !existsSync(base)) return;
+    const full = join(base, rel);
+    if (seen.has(full) || !existsSync(full)) return;
+    seen.add(full);
+    const display = base === gitRoot ? rel : join(base.replace(gitRoot + '/', ''), rel);
+    found.push({ path: display, label, scope: 'repo' });
+  };
+
+  // ── Repo-level fixed candidates ──
+  for (const { rel, label } of INSTRUCTION_CANDIDATES) {
+    checkFile(gitRoot, rel, label);
+    if (cwd && cwd !== gitRoot) checkFile(cwd, rel, label);
+  }
+
+  // ── Repo-level directory scans ──
+  for (const [subDir, label] of [
+    ['.github/instructions', 'Copilot'],
+    ['.cursor/rules',        'Cursor' ],
+  ] as const) {
+    const dir = gitRoot ? join(gitRoot, subDir) : '';
+    found.push(...scanDir(dir, ['.md', '.mdc', '.instructions.md'], label, 'repo', seen, home));
+  }
+
+  // ── Global / user-level directory scans ──
+  for (const { dir, label, exts } of globalInstructionDirs()) {
+    found.push(...scanDir(dir, exts, label, 'global', seen, home));
+  }
+
+  // ── Global / user-level single files ──
+  for (const { abs, label } of [
+    { abs: join(home, '.copilot', 'copilot-instructions.md'), label: 'Copilot' },
+    { abs: join(home, '.claude', 'CLAUDE.md'),                label: 'Claude'  },
+  ]) {
+    if (seen.has(abs) || !existsSync(abs)) continue;
+    seen.add(abs);
+    const display = '~' + abs.slice(home.length);
+    found.push({ path: display, label, scope: 'global' });
+  }
+
+  return found;
+}
+
 // ── Parsing ────────────────────────────────────────────────────────────
 
 function parseWorkspaceYaml(dir: string): SessionMeta {
   const yamlPath = join(dir, 'workspace.yaml');
-  const defaults: SessionMeta = { id: '', cwd: '', repository: '', branch: '', summary: '' };
+  const defaults: SessionMeta = { id: '', cwd: '', gitRoot: '', repository: '', branch: '', summary: '' };
   if (!existsSync(yamlPath)) return defaults;
 
   const text = readFileSync(yamlPath, 'utf-8');
@@ -119,6 +219,7 @@ function parseWorkspaceYaml(dir: string): SessionMeta {
   return {
     id: get('id'),
     cwd: get('cwd'),
+    gitRoot: get('git_root'),
     repository: get('repository'),
     branch: get('branch'),
     summary: get('summary'),
@@ -132,6 +233,7 @@ function parseEvents(dir: string): SessionStats {
   const stats: SessionStats = {
     meta,
     model: 'unknown',
+    reasoningEffort: '',
     startTime: '',
     lastActivity: '',
     isActive: hasLock,
@@ -143,6 +245,7 @@ function parseEvents(dir: string): SessionStats {
     activeSubagents: new Map(),
     completedSubagents: [],
     skills: [],
+    instructionFiles: findInstructionFiles(meta.gitRoot, meta.cwd),
   };
 
   const eventsFile = join(dir, 'events.jsonl');
@@ -171,6 +274,14 @@ function processEvent(stats: SessionStats, evt: any): void {
     case 'session.start':
       stats.startTime = evt.data?.startTime ?? ts;
       break;
+
+    case 'session.model_change': {
+      const newModel = evt.data?.newModel;
+      if (newModel) stats.model = newModel;
+      const effort = evt.data?.reasoningEffort;
+      if (effort) stats.reasoningEffort = effort;
+      break;
+    }
 
     case 'user.message':
       stats.turnCount.user++;
@@ -344,7 +455,8 @@ function render(stats: SessionStats): void {
   }
 
   const modelShort = stats.model.replace('claude-', '').replace('gpt-', 'GPT ');
-  console.log(`🤖 ${modelShort} | size=12 ${CLR}`);
+  const effort = stats.reasoningEffort ? ` (${stats.reasoningEffort})` : '';
+  console.log(`🤖 ${modelShort}${effort} | size=12 ${CLR}`);
 
   if (stats.startTime) {
     console.log(`⏱ ${formatDuration(stats.startTime)} | size=12 ${CLR}`);
@@ -395,6 +507,43 @@ function render(stats: SessionStats): void {
     for (const sk of stats.skills) {
       const time = formatTime(sk.timestamp);
       console.log(`  ${time} ${sk.name} | size=12 font=Menlo ${CLR_SUB}`);
+    }
+  }
+
+  // ── Instructions ──
+  if (stats.instructionFiles.length > 0) {
+    const repo    = stats.instructionFiles.filter(f => f.scope === 'repo');
+    const nonVsc  = stats.instructionFiles.filter(f => f.scope === 'global' && f.label !== 'VSCode');
+    const vscode  = stats.instructionFiles.filter(f => f.label === 'VSCode');
+    const visible = [...repo, ...nonVsc];
+
+    if (visible.length > 0 || vscode.length > 0) {
+      console.log('---');
+      const parts = [
+        repo.length   > 0 ? `${repo.length} repo`   : '',
+        nonVsc.length > 0 ? `${nonVsc.length} global` : '',
+        vscode.length > 0 ? `${vscode.length} vscode` : '',
+      ].filter(Boolean).join(' · ');
+      console.log(`📋 Instructions (${parts}) | size=13 ${CLR_HEAD}`);
+
+      for (const f of repo) {
+        console.log(`  [${f.label}] ${f.path} | size=12 font=Menlo ${CLR_SUB}`);
+      }
+      if (repo.length > 0 && nonVsc.length > 0) {
+        console.log(`  ─── global ─── | size=11 ${CLR_SUB}`);
+      }
+      for (const f of nonVsc) {
+        console.log(`  [${f.label}] ${f.path} | size=12 font=Menlo ${CLR_SUB}`);
+      }
+
+      // VSCode prompts as a drill-down submenu (hidden by default)
+      if (vscode.length > 0) {
+        console.log(`VSCode Prompts (${vscode.length}) | size=12 ${CLR_SUB}`);
+        for (const f of vscode) {
+          const name = f.path.split('/').pop() ?? f.path;
+          console.log(`--${name} | size=12 font=Menlo ${CLR_SUB}`);
+        }
+      }
     }
   }
 
