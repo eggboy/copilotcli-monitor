@@ -9,9 +9,10 @@
  */
 
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, unlinkSync, openSync, readSync, closeSync, mkdirSync } from 'fs';
-import { join, basename } from 'path';
+import { join, basename, dirname } from 'path';
 import { homedir } from 'os';
 import { createRequire } from 'module';
+import { fileURLToPath } from 'url';
 
 const COPILOT_DIR = join(homedir(), '.copilot');
 const SESSION_DIR = join(COPILOT_DIR, 'session-state');
@@ -19,6 +20,8 @@ const PIN_FILE = join(COPILOT_DIR, '.comonitor-primary');
 const CACHE_DIR = join(COPILOT_DIR, '.comonitor-cache');
 
 const requireSync = createRequire(import.meta.url);
+const MODULE_PATH = fileURLToPath(import.meta.url);
+const MODULE_DIR = dirname(MODULE_PATH);
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -124,6 +127,18 @@ interface SessionStats {
   todos: Todo[];
   inbox: InboxEntry[];
   toolFailures: ToolFailure[];
+}
+
+type JsonObject = Record<string, unknown>;
+
+interface CopilotEvent {
+  timestamp?: string;
+  type?: string;
+  data?: JsonObject;
+}
+
+function isObject(value: unknown): value is JsonObject {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 // ── Session Discovery ──────────────────────────────────────────────────
@@ -328,8 +343,8 @@ function parseEventsRange(
   for (const line of consumable.split('\n')) {
     if (!line) continue;
     try {
-      const evt = JSON.parse(line);
-      processEvent(stats, evt, pendingHooks);
+      const evt = JSON.parse(line) as unknown;
+      if (isObject(evt)) processEvent(stats, evt as CopilotEvent, pendingHooks);
     } catch {
       // skip malformed lines
     }
@@ -362,10 +377,17 @@ interface CacheEntry {
   mtimeMs: number;
   inode: number;
   lastOffset: number;
-  stats: any;            // serialized SessionStats
+  stats: SerializedSessionStats;
   pendingHooks: Array<[string, { hookType: string; startTs: string }]>;
   cachedAt: number;
 }
+
+type SerializedSessionStats = Omit<SessionStats, 'tools' | 'pendingTools' | 'activeSubagents' | 'mcpStatus'> & {
+  tools: Array<[string, ToolStat]>;
+  pendingTools: Array<[string, { name: string; startTs: string }]>;
+  activeSubagents: Array<[string, SubagentInfo]>;
+  mcpStatus: Array<[string, McpServerStatus]>;
+};
 
 function ensureCacheDir(): void {
   if (!existsSync(CACHE_DIR)) {
@@ -377,7 +399,7 @@ function cachePath(sessionId: string): string {
   return join(CACHE_DIR, `${sessionId}.json`);
 }
 
-function serializeStats(s: SessionStats): any {
+function serializeStats(s: SessionStats): SerializedSessionStats {
   return {
     ...s,
     tools:           Array.from(s.tools.entries()),
@@ -387,9 +409,16 @@ function serializeStats(s: SessionStats): any {
   };
 }
 
-function deserializeStats(s: any): SessionStats {
+function deserializeStats(s: Partial<SerializedSessionStats>): SessionStats {
   return {
     ...s,
+    meta:             s.meta             ?? { id: '', cwd: '', gitRoot: '', repository: '', branch: '', summary: '' },
+    model:            s.model            ?? 'unknown',
+    reasoningEffort:  s.reasoningEffort  ?? '',
+    startTime:        s.startTime        ?? '',
+    lastActivity:     s.lastActivity     ?? '',
+    isActive:         s.isActive         ?? false,
+    totalOutputTokens: s.totalOutputTokens ?? 0,
     tools:           new Map(s.tools ?? []),
     pendingTools:    new Map(s.pendingTools ?? []),
     activeSubagents: new Map(s.activeSubagents ?? []),
@@ -507,20 +536,21 @@ function pruneCache(liveSessionIds: Set<string>): void {
   } catch { /* ignore */ }
 }
 
-function processEvent(stats: SessionStats, evt: any, pendingHooks: Map<string, { hookType: string; startTs: string }>): void {
+function processEvent(stats: SessionStats, evt: CopilotEvent, pendingHooks: Map<string, { hookType: string; startTs: string }>): void {
   const ts = evt.timestamp ?? '';
+  const data = evt.data ?? {};
   if (ts) stats.lastActivity = ts;
 
   switch (evt.type) {
     case 'session.start':
-      stats.startTime = evt.data?.startTime ?? ts;
+      stats.startTime = typeof data.startTime === 'string' ? data.startTime : ts;
       break;
 
     case 'session.model_change': {
-      const newModel = evt.data?.newModel;
-      if (newModel) stats.model = newModel;
-      const effort = evt.data?.reasoningEffort;
-      if (effort) stats.reasoningEffort = effort;
+      const newModel = data.newModel;
+      if (typeof newModel === 'string') stats.model = newModel;
+      const effort = data.reasoningEffort;
+      if (typeof effort === 'string') stats.reasoningEffort = effort;
       break;
     }
 
@@ -530,15 +560,14 @@ function processEvent(stats: SessionStats, evt: any, pendingHooks: Map<string, {
 
     case 'assistant.message': {
       stats.turnCount.assistant++;
-      const data = evt.data ?? {};
-      if (data.outputTokens) stats.totalOutputTokens += data.outputTokens;
+      if (typeof data.outputTokens === 'number') stats.totalOutputTokens += data.outputTokens;
       // Extract model from tool execution_complete events (more reliable)
       break;
     }
 
     case 'tool.execution_start': {
-      const name = evt.data?.toolName ?? 'unknown';
-      const callId = evt.data?.toolCallId ?? '';
+      const name = typeof data.toolName === 'string' ? data.toolName : 'unknown';
+      const callId = typeof data.toolCallId === 'string' ? data.toolCallId : '';
       stats.pendingTools.set(callId, { name, startTs: ts });
 
       const existing = stats.tools.get(name);
@@ -552,10 +581,10 @@ function processEvent(stats: SessionStats, evt: any, pendingHooks: Map<string, {
     }
 
     case 'tool.execution_complete': {
-      const callId = evt.data?.toolCallId ?? '';
-      const success = evt.data?.success ?? true;
-      const model = evt.data?.model;
-      if (model) stats.model = model;
+      const callId = typeof data.toolCallId === 'string' ? data.toolCallId : '';
+      const success = typeof data.success === 'boolean' ? data.success : true;
+      const model = data.model;
+      if (typeof model === 'string') stats.model = model;
 
       const pending = stats.pendingTools.get(callId);
       const name = pending?.name ?? 'unknown';
@@ -564,8 +593,9 @@ function processEvent(stats: SessionStats, evt: any, pendingHooks: Map<string, {
       if (!success) {
         const stat = stats.tools.get(name);
         if (stat) stat.failed++;
-        const errMsg = String(evt.data?.error?.message ?? evt.data?.error ?? 'unknown error');
-        const errCode = String(evt.data?.error?.code ?? '');
+        const error = isObject(data.error) ? data.error : {};
+        const errMsg = String(error.message ?? data.error ?? 'unknown error');
+        const errCode = String(error.code ?? '');
         stats.toolFailures.push({ name, ts, code: errCode, message: errMsg });
         if (stats.toolFailures.length > 10) {
           stats.toolFailures = stats.toolFailures.slice(-10);
@@ -581,11 +611,11 @@ function processEvent(stats: SessionStats, evt: any, pendingHooks: Map<string, {
     }
 
     case 'skill.invoked': {
-      const name = evt.data?.name;
-      if (name) {
+      const name = data.name;
+      if (typeof name === 'string') {
         stats.skills.push({
           name,
-          description: evt.data?.description ?? '',
+          description: typeof data.description === 'string' ? data.description : '',
           timestamp: ts,
         });
       }
@@ -593,11 +623,13 @@ function processEvent(stats: SessionStats, evt: any, pendingHooks: Map<string, {
     }
 
     case 'subagent.started': {
-      const callId = evt.data?.toolCallId ?? '';
+      const callId = typeof data.toolCallId === 'string' ? data.toolCallId : '';
+      const agentName = typeof data.agentName === 'string' ? data.agentName : 'unknown';
+      const displayName = typeof data.agentDisplayName === 'string' ? data.agentDisplayName : agentName;
       const info: SubagentInfo = {
         callId,
-        name: evt.data?.agentName ?? 'unknown',
-        displayName: evt.data?.agentDisplayName ?? evt.data?.agentName ?? 'unknown',
+        name: agentName,
+        displayName,
         startTs: ts,
       };
       stats.activeSubagents.set(callId, info);
@@ -605,18 +637,18 @@ function processEvent(stats: SessionStats, evt: any, pendingHooks: Map<string, {
     }
 
     case 'subagent.completed': {
-      const callId = evt.data?.toolCallId ?? '';
+      const callId = typeof data.toolCallId === 'string' ? data.toolCallId : '';
       const active = stats.activeSubagents.get(callId);
       const completed: SubagentInfo = {
         callId,
-        name: evt.data?.agentName ?? active?.name ?? 'unknown',
-        displayName: evt.data?.agentDisplayName ?? active?.displayName ?? 'unknown',
+        name: typeof data.agentName === 'string' ? data.agentName : active?.name ?? 'unknown',
+        displayName: typeof data.agentDisplayName === 'string' ? data.agentDisplayName : active?.displayName ?? 'unknown',
         startTs: active?.startTs ?? ts,
         endTs: ts,
-        model: evt.data?.model,
-        totalToolCalls: evt.data?.totalToolCalls,
-        totalTokens: evt.data?.totalTokens,
-        durationMs: evt.data?.durationMs,
+        model: typeof data.model === 'string' ? data.model : undefined,
+        totalToolCalls: typeof data.totalToolCalls === 'number' ? data.totalToolCalls : undefined,
+        totalTokens: typeof data.totalTokens === 'number' ? data.totalTokens : undefined,
+        durationMs: typeof data.durationMs === 'number' ? data.durationMs : undefined,
       };
       stats.activeSubagents.delete(callId);
       stats.completedSubagents.push(completed);
@@ -624,21 +656,22 @@ function processEvent(stats: SessionStats, evt: any, pendingHooks: Map<string, {
     }
 
     case 'hook.start': {
-      const id = evt.data?.hookInvocationId ?? '';
-      const hookType = evt.data?.hookType ?? 'unknown';
+      const id = typeof data.hookInvocationId === 'string' ? data.hookInvocationId : '';
+      const hookType = typeof data.hookType === 'string' ? data.hookType : 'unknown';
       if (id) pendingHooks.set(id, { hookType, startTs: ts });
       break;
     }
 
     case 'hook.end': {
-      const id = evt.data?.hookInvocationId ?? '';
-      const success = evt.data?.success !== false; // default true if missing
+      const id = typeof data.hookInvocationId === 'string' ? data.hookInvocationId : '';
+      const success = data.success !== false; // default true if missing
       const pending = pendingHooks.get(id);
       pendingHooks.delete(id);
       if (!success) {
-        const msg = evt.data?.error?.message ?? 'hook failed';
+        const error = isObject(data.error) ? data.error : {};
+        const msg = error.message ?? 'hook failed';
         stats.hookFailures.push({
-          hookType: pending?.hookType ?? evt.data?.hookType ?? 'unknown',
+          hookType: pending?.hookType ?? (typeof data.hookType === 'string' ? data.hookType : 'unknown'),
           ts,
           message: String(msg).split('\n')[0].slice(0, 200),
         });
@@ -651,10 +684,9 @@ function processEvent(stats: SessionStats, evt: any, pendingHooks: Map<string, {
 
     case 'session.info':
     case 'session.warning': {
-      const d = evt.data ?? {};
-      const kind = d.infoType ?? d.warningType;
+      const kind = data.infoType ?? data.warningType;
       if (kind !== 'mcp') break;
-      const message: string = d.message ?? '';
+      const message = typeof data.message === 'string' ? data.message : '';
       // Messages look like:
       //   "GitHub MCP Server: Connected"
       //   `Failed to connect to MCP server "powerbi-remote". Execute …`
@@ -686,7 +718,22 @@ function processEvent(stats: SessionStats, evt: any, pendingHooks: Map<string, {
 // (the recommended runtime), then node:sqlite (Node ≥ 22 with the experimental
 // flag, stable in Node 24). Returns null if neither is available — the rest
 // of the UI continues to render without todos/inbox.
-type AnyDb = { prepare(sql: string): { all(): any[] }; close(): void };
+type AnyDb = { prepare(sql: string): { all(): unknown[] }; close(): void };
+
+interface TodoRow {
+  id?: unknown;
+  title?: unknown;
+  status?: unknown;
+  description?: unknown;
+}
+
+interface InboxRow {
+  sender_name?: unknown;
+  sender_type?: unknown;
+  summary?: unknown;
+  unread?: unknown;
+  sent_at?: unknown;
+}
 
 function openSessionDb(dir: string): AnyDb | null {
   const path = join(dir, 'session.db');
@@ -718,12 +765,12 @@ function readTodos(db: AnyDb): Todo[] {
          WHEN 'done'        THEN 3
          ELSE 4
        END, updated_at DESC`
-    ).all() as any[];
-    return rows.map(r => ({
+    ).all() as TodoRow[];
+    return rows.map((r) => ({
       id: String(r.id ?? ''),
       title: String(r.title ?? ''),
       status: (r.status ?? 'pending') as Todo['status'],
-      description: r.description ?? undefined,
+      description: typeof r.description === 'string' ? r.description : undefined,
     }));
   } catch {
     return []; // table may not exist in older session.db files
@@ -735,8 +782,8 @@ function readInbox(db: AnyDb): InboxEntry[] {
     const rows = db.prepare(
       `SELECT sender_name, sender_type, summary, unread, sent_at
        FROM inbox_entries ORDER BY sent_at DESC LIMIT 5`
-    ).all() as any[];
-    return rows.map(r => ({
+    ).all() as InboxRow[];
+    return rows.map((r) => ({
       senderName: String(r.sender_name ?? ''),
       senderType: String(r.sender_type ?? ''),
       summary: String(r.summary ?? ''),
@@ -1108,7 +1155,7 @@ if (sessions.length === 0) {
   render(stats);
   pruneCache(new Set(sessions.map(s => s.id)));
 
-  const SELF = join(import.meta.dir, basename(import.meta.path));
+  const SELF = join(MODULE_DIR, basename(MODULE_PATH));
   const BUN = process.argv[0]; // full path to the runtime that launched us
   if (pinnedId) {
     console.log(`📌 Pinned — Reset to Auto | bash="${BUN}" param1="${SELF}" param2="unpin" terminal=false refresh=true`);

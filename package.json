@@ -1,0 +1,31 @@
+{
+  "name": "copilotcli-monitor",
+  "version": "1.0.1",
+  "description": "A macOS menu bar plugin that shows real-time status of your [GitHub Copilot CLI](https://docs.github.com/en/copilot/github-copilot-in-the-cli) sessions. Built for [SwiftBar](https://github.com/swiftbar/SwiftBar) (also compatible with [xbar](https://xbarapp.com)).",
+  "private": true,
+  "scripts": {
+    "lint": "npm run lint:ts && npm run lint:shell",
+    "lint:ts": "eslint scripts/copilot-menubar.ts",
+    "lint:fix": "eslint scripts/copilot-menubar.ts --fix",
+    "lint:shell": "find scripts -type f -name '*.sh' -print0 | xargs -0 shellcheck",
+    "typecheck": "tsc --noEmit"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/eggboy/copilotcli-monitor.git"
+  },
+  "license": "MIT",
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/eggboy/copilotcli-monitor/issues"
+  },
+  "homepage": "https://github.com/eggboy/copilotcli-monitor#readme",
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^25.9.2",
+    "eslint": "^10.4.1",
+    "globals": "^17.6.0",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.60.1"
+  }
+}

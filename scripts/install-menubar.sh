@@ -3,7 +3,7 @@
 #
 # What it does:
 #   1. Detects SwiftBar or xbar (or offers to install SwiftBar)
-#   2. Symlinks the plugin + helper into the plugins directory
+#   2. Symlinks the plugin wrapper into the plugins directory
 #   3. Makes scripts executable
 
 set -euo pipefail

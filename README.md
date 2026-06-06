@@ -27,6 +27,7 @@ The GitHub Invertocat icon appears in your menu bar when a session is active. A 
 - **macOS** (required — SwiftBar/xbar are macOS-only)
 - **[Bun](https://bun.sh)** (recommended), [tsx](https://github.com/privatenumber/tsx), or Node.js — any TypeScript runtime
 - **GitHub Copilot CLI** — the agent must be running to produce session data
+- **ShellCheck** (development only) — required for `npm run lint`
 
 ## Installation
 
@@ -47,26 +48,25 @@ brew install oven-sh/bun/bun
 ### 3. Install the plugin
 
 ```bash
-git clone https://github.com/eggboy/comonitor.git
-cd comonitor/scripts
+git clone https://github.com/eggboy/copilotcli-monitor.git
+cd copilotcli-monitor/scripts
 ./install-menubar.sh
 ```
 
 The install script will:
 1. Detect your SwiftBar or xbar installation (or offer to install SwiftBar via Homebrew)
-2. Symlink the plugin and helper script into your plugins directory
+2. Symlink the `copilot-monitor.5s.sh` wrapper into your plugins directory
 3. Make scripts executable
 
 The monitor should appear in your menu bar within 5 seconds.
 
 ### Manual Installation
 
-If you prefer to install manually, symlink both files into your SwiftBar plugins directory:
+If you prefer to install manually, symlink the wrapper into your SwiftBar plugins directory. The wrapper resolves `copilot-menubar.ts` from the source checkout:
 
 ```bash
 PLUGINS_DIR="$(defaults read com.ameba.SwiftBar PluginDirectory)"
 ln -s "$(pwd)/copilot-monitor.5s.sh" "$PLUGINS_DIR/copilot-monitor.5s.sh"
-ln -s "$(pwd)/copilot-menubar.ts" "$PLUGINS_DIR/copilot-menubar.ts"
 chmod +x copilot-monitor.5s.sh copilot-menubar.ts
 ```
 
@@ -122,6 +122,10 @@ The refresh interval is controlled by the filename. Rename the plugin to change 
 - **Todos / inbox require an SQLite-capable runtime** — Bun has `bun:sqlite` built in (recommended). Node 22 needs `--experimental-sqlite`; Node 24+ has `node:sqlite` enabled by default. Without one of those, the Todos and Inbox sections are hidden silently; the rest of the monitor continues to work.
 - **Read-only** — The monitor only reads session state files. It cannot control, pause, or interact with Copilot CLI sessions.
 - **Session discovery** — Sessions are discovered from `~/.copilot/session-state/`. If the Copilot CLI changes its session storage location or format, the monitor will need to be updated.
+
+## Development
+
+Install dev dependencies with `npm install` and install ShellCheck with `brew install shellcheck`. Then run `npm run lint` to check the TypeScript helper with ESLint and `scripts/*.sh` with ShellCheck. Use `npm run typecheck` for a strict TypeScript sanity check.
 
 ## License
 
