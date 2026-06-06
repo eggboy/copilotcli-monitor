@@ -40,6 +40,7 @@ interface InstructionFile {
 interface ToolStat {
   name: string;
   count: number;
+  failed: number;
   lastTs: string;
 }
 
@@ -71,6 +72,13 @@ interface SkillInvocation {
 interface HookFailure {
   hookType: string;
   ts: string;
+  message: string;
+}
+
+interface ToolFailure {
+  name: string;
+  ts: string;
+  code: string;
   message: string;
 }
 
@@ -115,6 +123,7 @@ interface SessionStats {
   mcpStatus: Map<string, McpServerStatus>;
   todos: Todo[];
   inbox: InboxEntry[];
+  toolFailures: ToolFailure[];
 }
 
 // ── Session Discovery ──────────────────────────────────────────────────
@@ -282,6 +291,7 @@ function freshStats(meta: SessionMeta, hasLock: boolean): SessionStats {
     mcpStatus: new Map(),
     todos: [],
     inbox: [],
+    toolFailures: [],
   };
 }
 
@@ -344,7 +354,7 @@ function parseEvents(dir: string): SessionStats {
 
 // ── Cache layer ────────────────────────────────────────────────────────
 
-const CACHE_VERSION = 3;
+const CACHE_VERSION = 4;
 
 interface CacheEntry {
   v: number;
@@ -392,6 +402,7 @@ function deserializeStats(s: any): SessionStats {
     hookFailures:       s.hookFailures       ?? [],
     todos:              s.todos              ?? [],
     inbox:              s.inbox              ?? [],
+    toolFailures:       s.toolFailures       ?? [],
     turnCount:          s.turnCount          ?? { user: 0, assistant: 0 },
   };
 }
@@ -535,7 +546,7 @@ function processEvent(stats: SessionStats, evt: any, pendingHooks: Map<string, {
         existing.count++;
         existing.lastTs = ts;
       } else {
-        stats.tools.set(name, { name, count: 1, lastTs: ts });
+        stats.tools.set(name, { name, count: 1, failed: 0, lastTs: ts });
       }
       break;
     }
@@ -549,6 +560,17 @@ function processEvent(stats: SessionStats, evt: any, pendingHooks: Map<string, {
       const pending = stats.pendingTools.get(callId);
       const name = pending?.name ?? 'unknown';
       stats.pendingTools.delete(callId);
+
+      if (!success) {
+        const stat = stats.tools.get(name);
+        if (stat) stat.failed++;
+        const errMsg = String(evt.data?.error?.message ?? evt.data?.error ?? 'unknown error');
+        const errCode = String(evt.data?.error?.code ?? '');
+        stats.toolFailures.push({ name, ts, code: errCode, message: errMsg });
+        if (stats.toolFailures.length > 10) {
+          stats.toolFailures = stats.toolFailures.slice(-10);
+        }
+      }
 
       stats.recentTools.push({ name, timestamp: ts, success, callId });
       // Keep only last 10
@@ -845,12 +867,28 @@ function render(stats: SessionStats): void {
 
   // ── Stats ──
   const totalCalls = Array.from(stats.tools.values()).reduce((s, t) => s + t.count, 0);
+  const totalFailed = Array.from(stats.tools.values()).reduce((s, t) => s + (t.failed ?? 0), 0);
   const subagentTokens = stats.completedSubagents.reduce((s, sa) => s + (sa.totalTokens ?? 0), 0);
   const combinedTokens = stats.totalOutputTokens + subagentTokens;
   console.log('---');
-  console.log(`🔧 ${totalCalls} tool calls | size=12 ${CLR}`);
+  const failedSuffix = totalFailed > 0 ? ` (${totalFailed} failed)` : '';
+  console.log(`🔧 ${totalCalls} tool calls${failedSuffix} | size=12 ${CLR}`);
   console.log(`📊 ${formatNumber(combinedTokens)} tokens${subagentTokens > 0 ? ` (${formatNumber(stats.totalOutputTokens)} out + ${formatNumber(subagentTokens)} subagent)` : ''} | size=12 ${CLR}`);
   console.log(`💬 ${stats.turnCount.user} user / ${stats.turnCount.assistant} assistant turns | size=12 ${CLR}`);
+
+  // ── Recent tool failures ──
+  if (stats.toolFailures.length > 0) {
+    console.log('---');
+    console.log(`❌ Recent tool failures (${stats.toolFailures.length}) | size=13 ${CLR_HEAD}`);
+    const recent = stats.toolFailures.slice(-5).reverse();
+    for (const f of recent) {
+      const timeLabel = new Date(f.ts).toLocaleTimeString();
+      const firstLine = String(f.message).split('\n')[0]?.trim() ?? '';
+      const shortMsg = truncate(firstLine, 70);
+      console.log(`-- ${timeLabel} · 🔧 ${f.name} | size=11 ${CLR_SUB}`);
+      console.log(`---- ${shortMsg} | size=11 ${CLR_SUB}`);
+    }
+  }
 
   // ── Todos (from session.db) ──
   if (stats.todos.length > 0) {
