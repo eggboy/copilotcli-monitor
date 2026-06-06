@@ -18,12 +18,6 @@ const SESSION_DIR = join(COPILOT_DIR, 'session-state');
 const PIN_FILE = join(COPILOT_DIR, '.comonitor-primary');
 const CACHE_DIR = join(COPILOT_DIR, '.comonitor-cache');
 
-// Soft context-window cap used for the inline bar. Most Copilot CLI models we
-// see today (Claude Opus/Sonnet, GPT-5) sit between 200k and 1M; 200k is the
-// conservative "starts to feel full" threshold and matches when Copilot CLI
-// tends to compact in practice.
-const CONTEXT_SOFT_CAP = 200_000;
-
 const requireSync = createRequire(import.meta.url);
 
 // ── Types ──────────────────────────────────────────────────────────────
@@ -74,22 +68,6 @@ interface SkillInvocation {
   timestamp: string;
 }
 
-interface ContextInfo {
-  // Last authoritative snapshot of token usage, sourced from
-  // session.compaction_start / session.compaction_complete / session.shutdown.
-  systemTokens: number;
-  conversationTokens: number;
-  toolDefinitionsTokens: number;
-  currentTokens?: number;          // exact, from session.shutdown
-  sourceTs: string;                // timestamp of the snapshot
-  source: 'compaction_start' | 'compaction_complete' | 'shutdown';
-  // Tokens accumulated *after* sourceTs from assistant.message.outputTokens
-  // and subagent.completed.totalTokens. Coarse but directionally correct
-  // for live "context drift since last compaction".
-  postSnapshotTokens: number;
-  compactionCount: number;
-}
-
 interface HookFailure {
   hookType: string;
   ts: string;
@@ -133,7 +111,6 @@ interface SessionStats {
   completedSubagents: SubagentInfo[];
   skills: SkillInvocation[];
   instructionFiles: InstructionFile[];
-  context?: ContextInfo;
   hookFailures: HookFailure[];
   mcpStatus: Map<string, McpServerStatus>;
   todos: Todo[];
@@ -367,7 +344,7 @@ function parseEvents(dir: string): SessionStats {
 
 // ── Cache layer ────────────────────────────────────────────────────────
 
-const CACHE_VERSION = 2;
+const CACHE_VERSION = 3;
 
 interface CacheEntry {
   v: number;
@@ -543,10 +520,7 @@ function processEvent(stats: SessionStats, evt: any, pendingHooks: Map<string, {
     case 'assistant.message': {
       stats.turnCount.assistant++;
       const data = evt.data ?? {};
-      if (data.outputTokens) {
-        stats.totalOutputTokens += data.outputTokens;
-        if (stats.context) stats.context.postSnapshotTokens += data.outputTokens;
-      }
+      if (data.outputTokens) stats.totalOutputTokens += data.outputTokens;
       // Extract model from tool execution_complete events (more reliable)
       break;
     }
@@ -624,57 +598,6 @@ function processEvent(stats: SessionStats, evt: any, pendingHooks: Map<string, {
       };
       stats.activeSubagents.delete(callId);
       stats.completedSubagents.push(completed);
-      if (completed.totalTokens && stats.context) {
-        stats.context.postSnapshotTokens += completed.totalTokens;
-      }
-      break;
-    }
-
-    case 'session.compaction_start': {
-      const d = evt.data ?? {};
-      stats.context = {
-        systemTokens: d.systemTokens ?? 0,
-        conversationTokens: d.conversationTokens ?? 0,
-        toolDefinitionsTokens: d.toolDefinitionsTokens ?? 0,
-        sourceTs: ts,
-        source: 'compaction_start',
-        postSnapshotTokens: 0,
-        compactionCount: (stats.context?.compactionCount ?? 0),
-      };
-      break;
-    }
-
-    case 'session.compaction_complete': {
-      // After compaction the conversation effectively resets. The summary
-      // itself plus system + tool definitions becomes the new baseline.
-      const d = evt.data ?? {};
-      const prev = stats.context;
-      stats.context = {
-        // We don't get fresh system/tool token counts in the complete event;
-        // carry forward whatever the start event captured.
-        systemTokens: prev?.systemTokens ?? 0,
-        conversationTokens: 0, // baseline reset
-        toolDefinitionsTokens: prev?.toolDefinitionsTokens ?? 0,
-        sourceTs: ts,
-        source: 'compaction_complete',
-        postSnapshotTokens: 0,
-        compactionCount: (prev?.compactionCount ?? 0) + 1,
-      };
-      break;
-    }
-
-    case 'session.shutdown': {
-      const d = evt.data ?? {};
-      stats.context = {
-        systemTokens: d.systemTokens ?? 0,
-        conversationTokens: d.conversationTokens ?? 0,
-        toolDefinitionsTokens: d.toolDefinitionsTokens ?? 0,
-        currentTokens: d.currentTokens,
-        sourceTs: ts,
-        source: 'shutdown',
-        postSnapshotTokens: 0,
-        compactionCount: stats.context?.compactionCount ?? 0,
-      };
       break;
     }
 
@@ -851,17 +774,6 @@ function formatMs(ms: number): string {
   return `${mins}m ${rem}s`;
 }
 
-function totalContextTokens(c: ContextInfo): number {
-  if (c.currentTokens) return c.currentTokens + c.postSnapshotTokens;
-  return c.systemTokens + c.conversationTokens + c.toolDefinitionsTokens + c.postSnapshotTokens;
-}
-
-function contextBar(used: number, cap: number, cells = 10): string {
-  const ratio = Math.max(0, Math.min(1, used / cap));
-  const filled = Math.round(ratio * cells);
-  return '▰'.repeat(filled) + '▱'.repeat(cells - filled);
-}
-
 function truncate(s: string, max: number): string {
   if (s.length <= max) return s;
   return s.slice(0, Math.max(0, max - 1)) + '…';
@@ -939,27 +851,6 @@ function render(stats: SessionStats): void {
   console.log(`🔧 ${totalCalls} tool calls | size=12 ${CLR}`);
   console.log(`📊 ${formatNumber(combinedTokens)} tokens${subagentTokens > 0 ? ` (${formatNumber(stats.totalOutputTokens)} out + ${formatNumber(subagentTokens)} subagent)` : ''} | size=12 ${CLR}`);
   console.log(`💬 ${stats.turnCount.user} user / ${stats.turnCount.assistant} assistant turns | size=12 ${CLR}`);
-
-  // ── Context window ──
-  if (stats.context) {
-    const c = stats.context;
-    const used = totalContextTokens(c);
-    const pct = Math.round((used / CONTEXT_SOFT_CAP) * 100);
-    const bar = contextBar(used, CONTEXT_SOFT_CAP);
-    const compactionNote = c.compactionCount > 0
-      ? ` · ${c.compactionCount}× compacted`
-      : '';
-    const sourceLabel =
-      c.source === 'shutdown' ? 'at shutdown'
-      : c.source === 'compaction_complete' ? 'post-compaction'
-      : 'pre-compaction';
-    const driftNote = c.postSnapshotTokens > 0
-      ? ` +${formatNumber(c.postSnapshotTokens)} since`
-      : '';
-    console.log(`🧠 ${formatNumber(used)} / ${formatNumber(CONTEXT_SOFT_CAP)} ctx (${pct}%)${compactionNote} | size=12 ${CLR}`);
-    console.log(`   ${bar} | size=11 font=Menlo ${CLR_SUB}`);
-    console.log(`   ${sourceLabel} ${formatDuration(c.sourceTs)} ago${driftNote} | size=11 ${CLR_SUB}`);
-  }
 
   // ── Todos (from session.db) ──
   if (stats.todos.length > 0) {
