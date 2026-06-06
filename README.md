@@ -9,13 +9,17 @@ A macOS menu bar plugin that shows real-time status of your [GitHub Copilot CLI]
 - **Active session** — repository, branch, model, and duration
 - **Tool calls** — total count across all tools used
 - **Token usage** — combined output + subagent tokens
+- **Context window** — live estimate against a soft cap, derived from `session.compaction_*` / `session.shutdown` events plus running drift since the last snapshot, with a count of how many times the session has been compacted
 - **Conversation turns** — user and assistant message counts
+- **Todos** — in-progress / pending / blocked / done items pulled live from the per-session `session.db` SQLite store, with a drill-down for the full list
 - **Subagents** — active and completed subagents with duration, tool calls, and token stats
 - **Skills** — invoked skills with timestamps
+- **Inbox** — agent-to-agent inbox messages from `session.db` (unread items bolded)
+- **Hooks & MCP health** — recent `hook.end` failures and any failed MCP server connections; a ⚠️ replaces the menu-bar icon while problems are active
 - **Running tools** — currently executing tool calls
 - **Other sessions** — all other active Copilot CLI sessions in a submenu; click any session to switch the primary display to it (pin), and reset back to auto-selection at any time
 
-The GitHub Invertocat icon appears in your menu bar when a session is active. A grey dot shows when no sessions are running.
+The GitHub Invertocat icon appears in your menu bar when a session is active. A grey dot shows when no sessions are running, and ⚠️ appears when the active session has hook or MCP failures.
 
 ![Copilot Monitor Example](imgs/Copilot-monitor.png)
 
@@ -94,10 +98,12 @@ SwiftBar (every 5s)
 2. The **shell wrapper** sets up the PATH (Homebrew paths aren't available by default in SwiftBar) and delegates to the TypeScript helper using `bun`, `tsx`, or `npx tsx`
 3. The **TypeScript helper** reads Copilot CLI's session state from `~/.copilot/session-state/`:
    - `workspace.yaml` — repository, branch, working directory, summary
-   - `events.jsonl` — streaming event log with session start, messages, tool executions, subagent activity, skill invocations, etc.
+   - `events.jsonl` — streaming event log with session start, messages, tool executions, subagent activity, skill invocations, hook outcomes, MCP connect/fail status, compaction events, etc.
+   - `session.db` — per-session SQLite store opened **read-only** for the todo list and agent inbox (Bun's built-in `bun:sqlite`, with a Node 22+ `node:sqlite` fallback; sessions whose runtime lacks SQLite simply skip those sections)
    - `inuse.*.lock` — lock files indicating an actively running session
-4. Sessions are sorted by lock status (active first) then recency. The most recent active session gets the full display; other active sessions appear in a compact submenu
-5. Output follows the [SwiftBar plugin format](https://github.com/swiftbar/SwiftBar#plugin-api): pipe-delimited lines with styling parameters
+4. Derived stats are cached at `~/.copilot/.comonitor-cache/<sessionId>.json`. On each tick the helper tail-reads only the new bytes appended to `events.jsonl`, so the 5 s budget stays tight even when the session-state directory has hundreds of historical sessions. Cache entries for deleted sessions are pruned automatically.
+5. Sessions are sorted by lock status (active first) then recency. The most recent active session gets the full display; other active sessions appear in a compact submenu
+6. Output follows the [SwiftBar plugin format](https://github.com/swiftbar/SwiftBar#plugin-api): pipe-delimited lines with styling parameters
 
 ## Configuration
 
@@ -113,7 +119,8 @@ The refresh interval is controlled by the filename. Rename the plugin to change 
 
 - **Copilot CLI only** — This monitors [GitHub Copilot in the CLI](https://docs.github.com/en/copilot/github-copilot-in-the-cli) (the terminal agent). It does **not** monitor Copilot Chat in VS Code, JetBrains, or other editors, as those use different session state mechanisms.
 - **macOS only** — SwiftBar and xbar are macOS applications. There is no Linux or Windows support.
-- **No input token tracking** — Copilot CLI's `events.jsonl` only records output tokens per assistant message. Full input/context window token counts are only available in `session.shutdown` events (after a session ends), so live context window usage cannot be displayed for active sessions.
+- **Context window is an estimate, not a meter** — Copilot CLI only emits authoritative token counts in `session.compaction_start`, `session.compaction_complete`, and `session.shutdown`. Between those events the monitor displays the last known snapshot plus the sum of `assistant.message` output tokens and subagent token totals since then. The number is directionally correct but not byte-exact, and the soft cap (currently `200_000`, edit `CONTEXT_SOFT_CAP` in `copilot-menubar.ts` to change) is a UI hint, not the actual model context window.
+- **Todos / inbox require an SQLite-capable runtime** — Bun has `bun:sqlite` built in (recommended). Node 22 needs `--experimental-sqlite`; Node 24+ has `node:sqlite` enabled by default. Without one of those, the Todos and Inbox sections are hidden silently; the rest of the monitor continues to work.
 - **Read-only** — The monitor only reads session state files. It cannot control, pause, or interact with Copilot CLI sessions.
 - **Session discovery** — Sessions are discovered from `~/.copilot/session-state/`. If the Copilot CLI changes its session storage location or format, the monitor will need to be updated.
 

@@ -8,13 +8,23 @@
  * Usage: bun run scripts/copilot-menubar.ts
  */
 
-import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, unlinkSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, unlinkSync, openSync, readSync, closeSync, mkdirSync } from 'fs';
 import { join, basename } from 'path';
 import { homedir } from 'os';
+import { createRequire } from 'module';
 
 const COPILOT_DIR = join(homedir(), '.copilot');
 const SESSION_DIR = join(COPILOT_DIR, 'session-state');
 const PIN_FILE = join(COPILOT_DIR, '.comonitor-primary');
+const CACHE_DIR = join(COPILOT_DIR, '.comonitor-cache');
+
+// Soft context-window cap used for the inline bar. Most Copilot CLI models we
+// see today (Claude Opus/Sonnet, GPT-5) sit between 200k and 1M; 200k is the
+// conservative "starts to feel full" threshold and matches when Copilot CLI
+// tends to compact in practice.
+const CONTEXT_SOFT_CAP = 200_000;
+
+const requireSync = createRequire(import.meta.url);
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -64,6 +74,49 @@ interface SkillInvocation {
   timestamp: string;
 }
 
+interface ContextInfo {
+  // Last authoritative snapshot of token usage, sourced from
+  // session.compaction_start / session.compaction_complete / session.shutdown.
+  systemTokens: number;
+  conversationTokens: number;
+  toolDefinitionsTokens: number;
+  currentTokens?: number;          // exact, from session.shutdown
+  sourceTs: string;                // timestamp of the snapshot
+  source: 'compaction_start' | 'compaction_complete' | 'shutdown';
+  // Tokens accumulated *after* sourceTs from assistant.message.outputTokens
+  // and subagent.completed.totalTokens. Coarse but directionally correct
+  // for live "context drift since last compaction".
+  postSnapshotTokens: number;
+  compactionCount: number;
+}
+
+interface HookFailure {
+  hookType: string;
+  ts: string;
+  message: string;
+}
+
+interface McpServerStatus {
+  state: 'connected' | 'failed';
+  ts: string;
+  message: string;
+}
+
+interface Todo {
+  id: string;
+  title: string;
+  status: 'pending' | 'in_progress' | 'done' | 'blocked';
+  description?: string;
+}
+
+interface InboxEntry {
+  senderName: string;
+  senderType: string;
+  summary: string;
+  unread: boolean;
+  sentAt: number;
+}
+
 interface SessionStats {
   meta: SessionMeta;
   model: string;
@@ -80,6 +133,11 @@ interface SessionStats {
   completedSubagents: SubagentInfo[];
   skills: SkillInvocation[];
   instructionFiles: InstructionFile[];
+  context?: ContextInfo;
+  hookFailures: HookFailure[];
+  mcpStatus: Map<string, McpServerStatus>;
+  todos: Todo[];
+  inbox: InboxEntry[];
 }
 
 // ── Session Discovery ──────────────────────────────────────────────────
@@ -226,11 +284,8 @@ function parseWorkspaceYaml(dir: string): SessionMeta {
   };
 }
 
-function parseEvents(dir: string): SessionStats {
-  const meta = parseWorkspaceYaml(dir);
-  const hasLock = readdirSync(dir).some(f => f.startsWith('inuse.'));
-
-  const stats: SessionStats = {
+function freshStats(meta: SessionMeta, hasLock: boolean): SessionStats {
+  return {
     meta,
     model: 'unknown',
     reasoningEffort: '',
@@ -246,27 +301,225 @@ function parseEvents(dir: string): SessionStats {
     completedSubagents: [],
     skills: [],
     instructionFiles: findInstructionFiles(meta.gitRoot, meta.cwd),
+    hookFailures: [],
+    mcpStatus: new Map(),
+    todos: [],
+    inbox: [],
   };
+}
 
-  const eventsFile = join(dir, 'events.jsonl');
-  if (!existsSync(eventsFile)) return stats;
+// Reads bytes [fromOffset, totalSize) of events.jsonl and folds full lines
+// into `stats`/`pendingHooks`. Returns the new offset (advanced only past
+// complete, newline-terminated lines so a half-written tail line gets re-read
+// on the next tick).
+function parseEventsRange(
+  eventsFile: string,
+  fromOffset: number,
+  totalSize: number,
+  stats: SessionStats,
+  pendingHooks: Map<string, { hookType: string; startTs: string }>,
+): number {
+  const remaining = totalSize - fromOffset;
+  if (remaining <= 0) return fromOffset;
 
-  const content = readFileSync(eventsFile, 'utf-8');
-  const lines = content.split('\n').filter(l => l.trim());
+  const fd = openSync(eventsFile, 'r');
+  const buf = Buffer.alloc(remaining);
+  let read = 0;
+  while (read < remaining) {
+    const n = readSync(fd, buf, read, remaining - read, fromOffset + read);
+    if (n <= 0) break;
+    read += n;
+  }
+  closeSync(fd);
 
-  for (const line of lines) {
+  const text = buf.subarray(0, read).toString('utf-8');
+  // Advance only past the last newline so partial trailing line is re-read.
+  const lastNl = text.lastIndexOf('\n');
+  const consumable = lastNl >= 0 ? text.slice(0, lastNl + 1) : '';
+  const consumedBytes = Buffer.byteLength(consumable, 'utf-8');
+
+  for (const line of consumable.split('\n')) {
+    if (!line) continue;
     try {
       const evt = JSON.parse(line);
-      processEvent(stats, evt);
+      processEvent(stats, evt, pendingHooks);
     } catch {
       // skip malformed lines
     }
   }
 
+  return fromOffset + consumedBytes;
+}
+
+function parseEvents(dir: string): SessionStats {
+  const meta = parseWorkspaceYaml(dir);
+  const hasLock = readdirSync(dir).some(f => f.startsWith('inuse.'));
+  const stats = freshStats(meta, hasLock);
+
+  const eventsFile = join(dir, 'events.jsonl');
+  if (!existsSync(eventsFile)) return stats;
+
+  const size = statSync(eventsFile).size;
+  const pendingHooks = new Map<string, { hookType: string; startTs: string }>();
+  parseEventsRange(eventsFile, 0, size, stats, pendingHooks);
   return stats;
 }
 
-function processEvent(stats: SessionStats, evt: any): void {
+// ── Cache layer ────────────────────────────────────────────────────────
+
+const CACHE_VERSION = 2;
+
+interface CacheEntry {
+  v: number;
+  size: number;
+  mtimeMs: number;
+  inode: number;
+  lastOffset: number;
+  stats: any;            // serialized SessionStats
+  pendingHooks: Array<[string, { hookType: string; startTs: string }]>;
+  cachedAt: number;
+}
+
+function ensureCacheDir(): void {
+  if (!existsSync(CACHE_DIR)) {
+    try { mkdirSync(CACHE_DIR, { recursive: true }); } catch { /* ignore */ }
+  }
+}
+
+function cachePath(sessionId: string): string {
+  return join(CACHE_DIR, `${sessionId}.json`);
+}
+
+function serializeStats(s: SessionStats): any {
+  return {
+    ...s,
+    tools:           Array.from(s.tools.entries()),
+    pendingTools:    Array.from(s.pendingTools.entries()),
+    activeSubagents: Array.from(s.activeSubagents.entries()),
+    mcpStatus:       Array.from(s.mcpStatus.entries()),
+  };
+}
+
+function deserializeStats(s: any): SessionStats {
+  return {
+    ...s,
+    tools:           new Map(s.tools ?? []),
+    pendingTools:    new Map(s.pendingTools ?? []),
+    activeSubagents: new Map(s.activeSubagents ?? []),
+    mcpStatus:       new Map(s.mcpStatus ?? []),
+    // Defensive defaults in case schema added fields since cache was written.
+    recentTools:        s.recentTools        ?? [],
+    completedSubagents: s.completedSubagents ?? [],
+    skills:             s.skills             ?? [],
+    instructionFiles:   s.instructionFiles   ?? [],
+    hookFailures:       s.hookFailures       ?? [],
+    todos:              s.todos              ?? [],
+    inbox:              s.inbox              ?? [],
+    turnCount:          s.turnCount          ?? { user: 0, assistant: 0 },
+  };
+}
+
+function readCache(sessionId: string): CacheEntry | null {
+  const p = cachePath(sessionId);
+  if (!existsSync(p)) return null;
+  try {
+    const entry = JSON.parse(readFileSync(p, 'utf-8'));
+    if (entry?.v !== CACHE_VERSION) return null;
+    return entry as CacheEntry;
+  } catch {
+    return null;
+  }
+}
+
+function writeCache(sessionId: string, entry: CacheEntry): void {
+  ensureCacheDir();
+  try {
+    writeFileSync(cachePath(sessionId), JSON.stringify(entry));
+  } catch { /* best-effort, never fail the render */ }
+}
+
+// Public entry point: parse a session's events.jsonl, using the on-disk cache
+// to avoid re-reading bytes we've already folded into derived stats.
+function loadStats(sessionId: string, dir: string): SessionStats {
+  const eventsFile = join(dir, 'events.jsonl');
+  if (!existsSync(eventsFile)) return parseEvents(dir);
+
+  const st = statSync(eventsFile);
+  const cache = readCache(sessionId);
+
+  // Cache valid + file unchanged → reuse verbatim. Most ticks land here for
+  // idle "other sessions" — that's where the saved I/O matters.
+  if (
+    cache &&
+    cache.inode === st.ino &&
+    cache.size === st.size &&
+    cache.mtimeMs === st.mtimeMs
+  ) {
+    const reused = deserializeStats(cache.stats);
+    // Lock state is filesystem-driven, not event-driven; refresh each tick.
+    reused.isActive = readdirSync(dir).some(f => f.startsWith('inuse.'));
+    return reused;
+  }
+
+  // Cache valid + file only grew on same inode → tail-read new bytes.
+  if (
+    cache &&
+    cache.inode === st.ino &&
+    st.size > cache.size &&
+    cache.lastOffset <= st.size
+  ) {
+    const stats = deserializeStats(cache.stats);
+    const pendingHooks = new Map<string, { hookType: string; startTs: string }>(cache.pendingHooks ?? []);
+    const newOffset = parseEventsRange(eventsFile, cache.lastOffset, st.size, stats, pendingHooks);
+    stats.isActive = readdirSync(dir).some(f => f.startsWith('inuse.'));
+    writeCache(sessionId, {
+      v: CACHE_VERSION,
+      size: st.size,
+      mtimeMs: st.mtimeMs,
+      inode: st.ino,
+      lastOffset: newOffset,
+      stats: serializeStats(stats),
+      pendingHooks: Array.from(pendingHooks.entries()),
+      cachedAt: Date.now(),
+    });
+    return stats;
+  }
+
+  // Cache missing, stale, or file rotated/shrunk → full reparse.
+  const meta = parseWorkspaceYaml(dir);
+  const hasLock = readdirSync(dir).some(f => f.startsWith('inuse.'));
+  const stats = freshStats(meta, hasLock);
+  const pendingHooks = new Map<string, { hookType: string; startTs: string }>();
+  const newOffset = parseEventsRange(eventsFile, 0, st.size, stats, pendingHooks);
+  writeCache(sessionId, {
+    v: CACHE_VERSION,
+    size: st.size,
+    mtimeMs: st.mtimeMs,
+    inode: st.ino,
+    lastOffset: newOffset,
+    stats: serializeStats(stats),
+    pendingHooks: Array.from(pendingHooks.entries()),
+    cachedAt: Date.now(),
+  });
+  return stats;
+}
+
+// Best-effort pruning: drop cache entries whose session directory is gone.
+// Runs once per tick (cheap: a single readdir of the cache dir).
+function pruneCache(liveSessionIds: Set<string>): void {
+  if (!existsSync(CACHE_DIR)) return;
+  try {
+    for (const f of readdirSync(CACHE_DIR)) {
+      if (!f.endsWith('.json')) continue;
+      const id = f.slice(0, -'.json'.length);
+      if (!liveSessionIds.has(id)) {
+        try { unlinkSync(join(CACHE_DIR, f)); } catch { /* ignore */ }
+      }
+    }
+  } catch { /* ignore */ }
+}
+
+function processEvent(stats: SessionStats, evt: any, pendingHooks: Map<string, { hookType: string; startTs: string }>): void {
   const ts = evt.timestamp ?? '';
   if (ts) stats.lastActivity = ts;
 
@@ -290,7 +543,10 @@ function processEvent(stats: SessionStats, evt: any): void {
     case 'assistant.message': {
       stats.turnCount.assistant++;
       const data = evt.data ?? {};
-      if (data.outputTokens) stats.totalOutputTokens += data.outputTokens;
+      if (data.outputTokens) {
+        stats.totalOutputTokens += data.outputTokens;
+        if (stats.context) stats.context.postSnapshotTokens += data.outputTokens;
+      }
       // Extract model from tool execution_complete events (more reliable)
       break;
     }
@@ -368,8 +624,193 @@ function processEvent(stats: SessionStats, evt: any): void {
       };
       stats.activeSubagents.delete(callId);
       stats.completedSubagents.push(completed);
+      if (completed.totalTokens && stats.context) {
+        stats.context.postSnapshotTokens += completed.totalTokens;
+      }
       break;
     }
+
+    case 'session.compaction_start': {
+      const d = evt.data ?? {};
+      stats.context = {
+        systemTokens: d.systemTokens ?? 0,
+        conversationTokens: d.conversationTokens ?? 0,
+        toolDefinitionsTokens: d.toolDefinitionsTokens ?? 0,
+        sourceTs: ts,
+        source: 'compaction_start',
+        postSnapshotTokens: 0,
+        compactionCount: (stats.context?.compactionCount ?? 0),
+      };
+      break;
+    }
+
+    case 'session.compaction_complete': {
+      // After compaction the conversation effectively resets. The summary
+      // itself plus system + tool definitions becomes the new baseline.
+      const d = evt.data ?? {};
+      const prev = stats.context;
+      stats.context = {
+        // We don't get fresh system/tool token counts in the complete event;
+        // carry forward whatever the start event captured.
+        systemTokens: prev?.systemTokens ?? 0,
+        conversationTokens: 0, // baseline reset
+        toolDefinitionsTokens: prev?.toolDefinitionsTokens ?? 0,
+        sourceTs: ts,
+        source: 'compaction_complete',
+        postSnapshotTokens: 0,
+        compactionCount: (prev?.compactionCount ?? 0) + 1,
+      };
+      break;
+    }
+
+    case 'session.shutdown': {
+      const d = evt.data ?? {};
+      stats.context = {
+        systemTokens: d.systemTokens ?? 0,
+        conversationTokens: d.conversationTokens ?? 0,
+        toolDefinitionsTokens: d.toolDefinitionsTokens ?? 0,
+        currentTokens: d.currentTokens,
+        sourceTs: ts,
+        source: 'shutdown',
+        postSnapshotTokens: 0,
+        compactionCount: stats.context?.compactionCount ?? 0,
+      };
+      break;
+    }
+
+    case 'hook.start': {
+      const id = evt.data?.hookInvocationId ?? '';
+      const hookType = evt.data?.hookType ?? 'unknown';
+      if (id) pendingHooks.set(id, { hookType, startTs: ts });
+      break;
+    }
+
+    case 'hook.end': {
+      const id = evt.data?.hookInvocationId ?? '';
+      const success = evt.data?.success !== false; // default true if missing
+      const pending = pendingHooks.get(id);
+      pendingHooks.delete(id);
+      if (!success) {
+        const msg = evt.data?.error?.message ?? 'hook failed';
+        stats.hookFailures.push({
+          hookType: pending?.hookType ?? evt.data?.hookType ?? 'unknown',
+          ts,
+          message: String(msg).split('\n')[0].slice(0, 200),
+        });
+        if (stats.hookFailures.length > 5) {
+          stats.hookFailures = stats.hookFailures.slice(-5);
+        }
+      }
+      break;
+    }
+
+    case 'session.info':
+    case 'session.warning': {
+      const d = evt.data ?? {};
+      const kind = d.infoType ?? d.warningType;
+      if (kind !== 'mcp') break;
+      const message: string = d.message ?? '';
+      // Messages look like:
+      //   "GitHub MCP Server: Connected"
+      //   `Failed to connect to MCP server "powerbi-remote". Execute …`
+      const failed = evt.type === 'session.warning' || /fail/i.test(message);
+      // Extract a server name. Prefer a quoted name; otherwise take the
+      // leading "<name>: …" segment up to the first colon.
+      let server = '';
+      const quoted = message.match(/"([^"]+)"/);
+      if (quoted) {
+        server = quoted[1];
+      } else {
+        const colon = message.indexOf(':');
+        if (colon > 0) server = message.slice(0, colon).trim();
+      }
+      if (!server) break;
+      stats.mcpStatus.set(server, {
+        state: failed ? 'failed' : 'connected',
+        ts,
+        message: message.slice(0, 200),
+      });
+      break;
+    }
+  }
+}
+
+// ── Session DB (todos + inbox) ─────────────────────────────────────────
+
+// Best-effort SQLite read of <sessionDir>/session.db. Tries bun:sqlite first
+// (the recommended runtime), then node:sqlite (Node ≥ 22 with the experimental
+// flag, stable in Node 24). Returns null if neither is available — the rest
+// of the UI continues to render without todos/inbox.
+type AnyDb = { prepare(sql: string): { all(): any[] }; close(): void };
+
+function openSessionDb(dir: string): AnyDb | null {
+  const path = join(dir, 'session.db');
+  if (!existsSync(path)) return null;
+
+  // Bun's built-in SQLite. {readonly:true} prevents WAL/shm writes.
+  try {
+    const { Database } = requireSync('bun:sqlite');
+    return new Database(path, { readonly: true });
+  } catch { /* not on Bun */ }
+
+  // Node 22+ built-in SQLite (experimental until 24). Same prepare/all API.
+  try {
+    const { DatabaseSync } = requireSync('node:sqlite');
+    return new DatabaseSync(path, { readOnly: true });
+  } catch { /* not on Node 22+ with sqlite enabled */ }
+
+  return null;
+}
+
+function readTodos(db: AnyDb): Todo[] {
+  try {
+    const rows = db.prepare(
+      `SELECT id, title, status, description FROM todos
+       ORDER BY CASE status
+         WHEN 'in_progress' THEN 0
+         WHEN 'pending'     THEN 1
+         WHEN 'blocked'     THEN 2
+         WHEN 'done'        THEN 3
+         ELSE 4
+       END, updated_at DESC`
+    ).all() as any[];
+    return rows.map(r => ({
+      id: String(r.id ?? ''),
+      title: String(r.title ?? ''),
+      status: (r.status ?? 'pending') as Todo['status'],
+      description: r.description ?? undefined,
+    }));
+  } catch {
+    return []; // table may not exist in older session.db files
+  }
+}
+
+function readInbox(db: AnyDb): InboxEntry[] {
+  try {
+    const rows = db.prepare(
+      `SELECT sender_name, sender_type, summary, unread, sent_at
+       FROM inbox_entries ORDER BY sent_at DESC LIMIT 5`
+    ).all() as any[];
+    return rows.map(r => ({
+      senderName: String(r.sender_name ?? ''),
+      senderType: String(r.sender_type ?? ''),
+      summary: String(r.summary ?? ''),
+      unread: !!r.unread,
+      sentAt: Number(r.sent_at ?? 0),
+    }));
+  } catch {
+    return [];
+  }
+}
+
+function enrichWithSessionDb(stats: SessionStats, dir: string): void {
+  const db = openSessionDb(dir);
+  if (!db) return;
+  try {
+    stats.todos = readTodos(db);
+    stats.inbox = readInbox(db);
+  } finally {
+    try { db.close(); } catch { /* ignore */ }
   }
 }
 
@@ -410,19 +851,44 @@ function formatMs(ms: number): string {
   return `${mins}m ${rem}s`;
 }
 
+function totalContextTokens(c: ContextInfo): number {
+  if (c.currentTokens) return c.currentTokens + c.postSnapshotTokens;
+  return c.systemTokens + c.conversationTokens + c.toolDefinitionsTokens + c.postSnapshotTokens;
+}
+
+function contextBar(used: number, cap: number, cells = 10): string {
+  const ratio = Math.max(0, Math.min(1, used / cap));
+  const filled = Math.round(ratio * cells);
+  return '▰'.repeat(filled) + '▱'.repeat(cells - filled);
+}
+
+function truncate(s: string, max: number): string {
+  if (s.length <= max) return s;
+  return s.slice(0, Math.max(0, max - 1)) + '…';
+}
+
 // GitHub Invertocat mark — 18x18 black-on-transparent PNG for templateImage
 const GITHUB_ICON = 'iVBORw0KGgoAAAANSUhEUgAAABIAAAASCAYAAABWzo5XAAAABmJLR0QA/wD/AP+gvaeTAAABbUlEQVQ4jZXTPWtUQRTG8V/uEhBXRBQUWTbFLrZCBBtBsTZYpDIYCPY2wS8gaGcnqI2VnVba2Il+gEhIsoEEzErSJBokCagoi2/Fnasn17tJ9oGBuXOe85+ZM+cOqVYT47iI0/iNdbzBC3zok/dXx/AAvZRcNb7hHg73g7SxvAegPGbRKENOYCUZvhwAUnjmcQSGEugprqX5CI7jDo7iPTK0sInbKW8x+R/hJoziV9jtUL+7B50K/h5aGa6Hk322RxGDavie5sOYgLlAv3sASKH7Ie91Ju+ZQjMDgKK3maEeFrIBQLUwr2f4FBZGBwCdC/NNeO7fXTfkT7+fGtgJeY9hKn10U7CDy6WjFxrGGN7Z3aBXyPtmDUs4j9UU3MLJAGnjq/+7fEGo7Rh+4hnOyH/c6YoTdUuQHi6UTbfkHf4Ql+wuZqG3AfIDNyo8YBLbyfiqIj6bYh9xNQbKBe3gSdptowJ2Fi/lDzQfA38Am7p3Of8VttAAAAAASUVORK5CYII=';
 
 function statusIcon(stats: SessionStats): string {
+  const hasProblem = stats.hookFailures.length > 0 || hasFailedMcp(stats);
   if (!stats.isActive) {
     // No inuse lock — check recency of last event
     if (!stats.lastActivity) return '⚪ | size=14';
     const ageSec = (Date.now() - new Date(stats.lastActivity).getTime()) / 1000;
-    if (ageSec < 300) return '🟡 | size=14'; // recently finished
+    if (ageSec < 300) return `${hasProblem ? '🟠' : '🟡'} | size=14`; // recently finished
     return '⚪ | size=14';
   }
-  // Session has an inuse lock → show GitHub icon
+  // Session has an inuse lock → show GitHub icon, append a warning dot
+  // alongside when hooks/MCP servers are in a failed state so the user
+  // notices without opening the menu.
+  if (hasProblem) return `⚠️ | size=14`;
   return `| templateImage=${GITHUB_ICON}`;
+}
+
+function hasFailedMcp(stats: SessionStats): boolean {
+  for (const [, s] of stats.mcpStatus) if (s.state === 'failed') return true;
+  return false;
 }
 
 // ── Output ─────────────────────────────────────────────────────────────
@@ -474,6 +940,67 @@ function render(stats: SessionStats): void {
   console.log(`📊 ${formatNumber(combinedTokens)} tokens${subagentTokens > 0 ? ` (${formatNumber(stats.totalOutputTokens)} out + ${formatNumber(subagentTokens)} subagent)` : ''} | size=12 ${CLR}`);
   console.log(`💬 ${stats.turnCount.user} user / ${stats.turnCount.assistant} assistant turns | size=12 ${CLR}`);
 
+  // ── Context window ──
+  if (stats.context) {
+    const c = stats.context;
+    const used = totalContextTokens(c);
+    const pct = Math.round((used / CONTEXT_SOFT_CAP) * 100);
+    const bar = contextBar(used, CONTEXT_SOFT_CAP);
+    const compactionNote = c.compactionCount > 0
+      ? ` · ${c.compactionCount}× compacted`
+      : '';
+    const sourceLabel =
+      c.source === 'shutdown' ? 'at shutdown'
+      : c.source === 'compaction_complete' ? 'post-compaction'
+      : 'pre-compaction';
+    const driftNote = c.postSnapshotTokens > 0
+      ? ` +${formatNumber(c.postSnapshotTokens)} since`
+      : '';
+    console.log(`🧠 ${formatNumber(used)} / ${formatNumber(CONTEXT_SOFT_CAP)} ctx (${pct}%)${compactionNote} | size=12 ${CLR}`);
+    console.log(`   ${bar} | size=11 font=Menlo ${CLR_SUB}`);
+    console.log(`   ${sourceLabel} ${formatDuration(c.sourceTs)} ago${driftNote} | size=11 ${CLR_SUB}`);
+  }
+
+  // ── Todos (from session.db) ──
+  if (stats.todos.length > 0) {
+    const inProgress = stats.todos.filter(t => t.status === 'in_progress');
+    const pending    = stats.todos.filter(t => t.status === 'pending');
+    const blocked    = stats.todos.filter(t => t.status === 'blocked');
+    const done       = stats.todos.filter(t => t.status === 'done');
+    console.log('---');
+    const parts = [
+      inProgress.length ? `${inProgress.length} in-progress` : '',
+      pending.length    ? `${pending.length} pending`        : '',
+      blocked.length    ? `${blocked.length} blocked`        : '',
+      done.length       ? `${done.length} done`              : '',
+    ].filter(Boolean).join(' · ');
+    console.log(`📝 Todos (${parts}) | size=13 ${CLR_HEAD}`);
+    for (const t of inProgress) {
+      console.log(`  🔄 ${truncate(t.title, 80)} | size=12 font=Menlo ${CLR_SUB}`);
+    }
+    for (const t of pending.slice(0, 5)) {
+      console.log(`  ⬜ ${truncate(t.title, 80)} | size=12 font=Menlo ${CLR_SUB}`);
+    }
+    if (pending.length > 5) {
+      console.log(`  … and ${pending.length - 5} more pending | size=11 ${CLR_SUB}`);
+    }
+    for (const t of blocked) {
+      const why = t.description ? ` — ${truncate(t.description, 60)}` : '';
+      console.log(`  🚫 ${truncate(t.title, 60)}${why} | size=12 font=Menlo ${CLR_SUB}`);
+    }
+    // Drill-down with everything (including all done items).
+    if (stats.todos.length > inProgress.length + Math.min(pending.length, 5) + blocked.length) {
+      console.log(`All Todos (${stats.todos.length}) | size=12 ${CLR_SUB}`);
+      for (const t of stats.todos) {
+        const icon = t.status === 'done' ? '✅'
+                   : t.status === 'in_progress' ? '🔄'
+                   : t.status === 'blocked' ? '🚫'
+                   : '⬜';
+        console.log(`--${icon} ${truncate(t.title, 90)} | size=12 font=Menlo ${CLR_SUB}`);
+      }
+    }
+  }
+
   // ── Subagents ──
   const totalSubagents = stats.activeSubagents.size + stats.completedSubagents.length;
   if (totalSubagents > 0) {
@@ -507,6 +1034,45 @@ function render(stats: SessionStats): void {
     for (const sk of stats.skills) {
       const time = formatTime(sk.timestamp);
       console.log(`  ${time} ${sk.name} | size=12 font=Menlo ${CLR_SUB}`);
+    }
+  }
+
+  // ── Inbox (from session.db) ──
+  if (stats.inbox.length > 0) {
+    const unread = stats.inbox.filter(e => e.unread).length;
+    console.log('---');
+    const tag = unread > 0 ? ` (${unread} unread)` : '';
+    console.log(`📬 Inbox${tag} | size=13 ${CLR_HEAD}`);
+    for (const e of stats.inbox) {
+      const font = e.unread ? 'font=Menlo-Bold' : 'font=Menlo';
+      const tagPart = e.senderType ? `[${e.senderType}] ` : '';
+      console.log(`  ${tagPart}${e.senderName} — ${truncate(e.summary, 60)} | size=12 ${font} ${CLR_SUB}`);
+    }
+  }
+
+  // ── Hooks & MCP health ──
+  const failedMcp = Array.from(stats.mcpStatus.entries())
+    .filter(([, s]) => s.state === 'failed');
+  const connectedMcp = Array.from(stats.mcpStatus.entries())
+    .filter(([, s]) => s.state === 'connected');
+  if (stats.hookFailures.length > 0 || failedMcp.length > 0) {
+    console.log('---');
+    const parts = [
+      stats.hookFailures.length > 0 ? `${stats.hookFailures.length} hook fail` : '',
+      failedMcp.length > 0          ? `${failedMcp.length} MCP down`          : '',
+    ].filter(Boolean).join(' · ');
+    console.log(`🪝 Hooks & MCP (${parts}) | size=13 ${CLR_HEAD}`);
+    for (const h of stats.hookFailures.slice(-5).reverse()) {
+      console.log(`  ❌ ${formatTime(h.ts)} ${h.hookType} — ${truncate(h.message, 70)} | size=12 font=Menlo ${CLR_SUB}`);
+    }
+    for (const [name, s] of failedMcp) {
+      console.log(`  🔌 ${name}: failed — ${truncate(s.message, 70)} | size=12 font=Menlo ${CLR_SUB}`);
+    }
+    if (connectedMcp.length > 0) {
+      console.log(`MCP servers (${connectedMcp.length} ok) | size=12 ${CLR_SUB}`);
+      for (const [name] of connectedMcp) {
+        console.log(`--✅ ${name} | size=12 font=Menlo ${CLR_SUB}`);
+      }
     }
   }
 
@@ -608,8 +1174,10 @@ if (sessions.length === 0) {
   }
 
   const primary = sessions[primaryIdx];
-  const stats = parseEvents(primary.dir);
+  const stats = loadStats(primary.id, primary.dir);
+  enrichWithSessionDb(stats, primary.dir);
   render(stats);
+  pruneCache(new Set(sessions.map(s => s.id)));
 
   const SELF = join(import.meta.dir, basename(import.meta.path));
   const BUN = process.argv[0]; // full path to the runtime that launched us
@@ -623,7 +1191,7 @@ if (sessions.length === 0) {
     console.log('---');
     console.log(`Other Sessions (${others.length}) | size=13 ${CLR_HEAD}`);
     for (const s of others) {
-      const other = parseEvents(s.dir);
+      const other = loadStats(s.id, s.dir);
       const repo = other.meta.repository?.split('/').pop() || (other.meta.cwd ? basename(other.meta.cwd) : 'unknown');
       const model = other.model.replace('claude-', '').replace('gpt-', 'GPT ');
       const calls = Array.from(other.tools.values()).reduce((sum, t) => sum + t.count, 0);
